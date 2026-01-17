@@ -2156,7 +2156,7 @@ class AnalyticsTools:
         include_url: bool
     ) -> List[Dict]:
         """
-        对新闻列表进行相似度聚合
+        对新闻列表进行相似度聚合 (优化版: 贪心聚类 + Jaccard预筛选)
 
         Args:
             news_list: 新闻列表
@@ -2169,83 +2169,127 @@ class AnalyticsTools:
         if not news_list:
             return []
 
-        # 按权重排序，优先保留高权重新闻作为代表
+        # 按权重排序，确保高质量新闻作为聚类中心
         sorted_news = sorted(news_list, key=lambda x: x.get("weight", 0), reverse=True)
+        
+        # 预计算所有标题的字符集合，用于快速Jaccard筛选
+        # 牺牲少量内存换取大量时间
+        news_with_chars = []
+        for news in sorted_news:
+            news_with_chars.append({
+                "data": news,
+                "chars": set(news["title"]), # 字符集合
+                "len": len(news["title"])
+            })
 
         aggregated = []
-        used_indices = set()
 
-        for i, news in enumerate(sorted_news):
-            if i in used_indices:
-                continue
-
-            # 创建聚合组
-            group = {
-                "representative_title": news["title"],
-                "platforms": [news["platform_name"]],
-                "platform_ids": [news["platform"]],
-                "dates": [news["date"]],
-                "best_rank": news["rank"],
-                "total_count": news["count"],
-                "aggregate_weight": news.get("weight", 0),
-                "sources": [{
-                    "platform": news["platform_name"],
-                    "rank": news["rank"],
-                    "date": news["date"]
-                }]
-            }
-
-            if include_url and news.get("url"):
-                group["urls"] = [{
-                    "platform": news["platform_name"],
-                    "url": news.get("url", ""),
-                    "mobileUrl": news.get("mobileUrl", "")
-                }]
-
-            used_indices.add(i)
-
-            # 查找相似新闻
-            for j, other_news in enumerate(sorted_news):
-                if j in used_indices:
+        # 遍历所有新闻
+        for item in news_with_chars:
+            news = item["data"]
+            news_chars = item["chars"]
+            news_len = item["len"]
+            
+            is_merged = False
+            
+            # 尝试合并到现有聚类
+            for group in aggregated:
+                rep_chars = group["_rep_chars"]
+                rep_len = group["_rep_len"]
+                rep_title = group["representative_title"]
+                
+                # 1. 长度过滤器: 如果长度差异过大，直接跳过
+                # 如果长度比率小于阈值的0.5倍(非常这也是个近似)，跳过
+                len_ratio = min(news_len, rep_len) / max(news_len, rep_len)
+                if len_ratio < 0.3: # 宽松的长度过滤
                     continue
-
-                similarity = self._calculate_similarity(news["title"], other_news["title"])
+                    
+                # 2. Jaccard 相似度预筛选 (极快)
+                # Jaccard = Intersection / Union
+                # 如果 Jaccard 相似度远低于 difflib 阈值，则跳过昂贵的 SequenceMatcher
+                # 经验值：Jaccard 通常比 SequenceMatcher 低，所以用 threshold * 0.5 作为门槛
+                intersection = len(news_chars & rep_chars)
+                union = len(news_chars | rep_chars)
+                jaccard = intersection / union if union > 0 else 0
+                
+                if jaccard < (threshold * 0.4): 
+                    continue
+                
+                # 3. 精确计算 (昂贵)
+                similarity = self._calculate_similarity(news["title"], rep_title)
 
                 if similarity >= threshold:
                     # 合并到当前组
-                    if other_news["platform_name"] not in group["platforms"]:
-                        group["platforms"].append(other_news["platform_name"])
-                        group["platform_ids"].append(other_news["platform"])
+                    if news["platform_name"] not in group["platforms"]:
+                        group["platforms"].append(news["platform_name"])
+                        group["platform_ids"].append(news["platform"])
 
-                    if other_news["date"] not in group["dates"]:
-                        group["dates"].append(other_news["date"])
+                    if news["date"] not in group["dates"]:
+                        group["dates"].append(news["date"])
 
-                    group["best_rank"] = min(group["best_rank"], other_news["rank"])
-                    group["total_count"] += other_news["count"]
-                    group["aggregate_weight"] += other_news.get("weight", 0) * 0.5  # 额外权重
+                    group["best_rank"] = min(group["best_rank"], news["rank"])
+                    group["total_count"] += news["count"]
+                    group["aggregate_weight"] += news.get("weight", 0) * 0.5
 
                     group["sources"].append({
-                        "platform": other_news["platform_name"],
-                        "rank": other_news["rank"],
-                        "date": other_news["date"]
+                        "platform": news["platform_name"],
+                        "rank": news["rank"],
+                        "date": news["date"]
                     })
 
-                    if include_url and other_news.get("url"):
+                    if include_url and news.get("url"):
                         if "urls" not in group:
                             group["urls"] = []
-                        group["urls"].append({
-                            "platform": other_news["platform_name"],
-                            "url": other_news.get("url", ""),
-                            "mobileUrl": other_news.get("mobileUrl", "")
-                        })
+                        # 避免重复URL
+                        existing_urls = {u["url"] for u in group["urls"]}
+                        if news.get("url") not in existing_urls:
+                            group["urls"].append({
+                                "platform": news["platform_name"],
+                                "url": news.get("url", ""),
+                                "mobileUrl": news.get("mobileUrl", "")
+                            })
 
-                    used_indices.add(j)
+                    is_merged = True
+                    break
+            
+            if not is_merged:
+                # 创建新聚类
+                new_group = {
+                    "representative_title": news["title"],
+                    "platforms": [news["platform_name"]],
+                    "platform_ids": [news["platform"]],
+                    "dates": [news["date"]],
+                    "best_rank": news["rank"],
+                    "total_count": news["count"],
+                    "aggregate_weight": news.get("weight", 0),
+                    "sources": [{
+                        "platform": news["platform_name"],
+                        "rank": news["rank"],
+                        "date": news["date"]
+                    }],
+                    # 缓存辅助数据供后续比较
+                    "_rep_chars": news_chars,
+                    "_rep_len": news_len
+                }
 
-            # 添加聚合信息
+                if include_url and news.get("url"):
+                    new_group["urls"] = [{
+                        "platform": news["platform_name"],
+                        "url": news.get("url", ""),
+                        "mobileUrl": news.get("mobileUrl", "")
+                    }]
+                
+                group["platform_count"] = 1
+                group["is_cross_platform"] = False
+
+                aggregated.append(new_group)
+
+        # 清理辅助字段并完善统计
+        for group in aggregated:
+            del group["_rep_chars"]
+            del group["_rep_len"]
             group["platform_count"] = len(group["platforms"])
             group["is_cross_platform"] = len(group["platforms"]) > 1
-
-            aggregated.append(group)
 
         return aggregated
 
