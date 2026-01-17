@@ -1,0 +1,7 @@
+output/
+config/config.yaml
+config/frequency_words.txt
+__pycache__/
+*.pyc
+.env
+.venv
