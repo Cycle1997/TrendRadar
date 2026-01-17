@@ -1962,17 +1962,20 @@ class AnalyticsTools:
 
     def _calculate_similarity(self, text1: str, text2: str) -> float:
         """
-        计算两个文本的相似度
-
-        Args:
-            text1: 文本1
-            text2: 文本2
-
-        Returns:
-            相似度分数（0-1之间）
+        计算两个文本的相似度 (优化版)
         """
-        # 使用 SequenceMatcher 计算相似度
-        return SequenceMatcher(None, text1, text2).ratio()
+        matcher = SequenceMatcher(None, text1, text2)
+        
+        # 1. 极速检查: 长度差异过大直接放弃
+        if matcher.real_quick_ratio() < 0.4:  # 宽松阈值，毕竟只要过滤掉极其不相关的
+            return 0.0
+            
+        # 2. 快速检查: 字符集相似度
+        if matcher.quick_ratio() < 0.5:
+             return 0.0
+             
+        # 3. 精确计算
+        return matcher.ratio()
 
     def _find_unique_topics(self, platform_stats: Dict) -> Dict[str, List[str]]:
         """
@@ -2157,47 +2160,65 @@ class AnalyticsTools:
         include_url: bool
     ) -> List[Dict]:
         """
-        对新闻列表进行相似度聚合
-
-        使用双层过滤策略：先用 Jaccard 快速粗筛，再用 SequenceMatcher 精确计算
-
+        对新闻列表进行相似度聚合 (优化版 O(N*logN))
+        
+        采用 "倒排索引 + 贪婪聚类" (Inverted Index + Greedy Clustering) 策略：
+        1. 按权重排序，确保高质量新闻成为聚类中心（代表）。
+        2. 维护一个 Token -> Cluster 映射的倒排索引。
+        3. 对每条新闻，仅与共享 Token 的已存在聚类中心进行比较。
+        
         Args:
             news_list: 新闻列表
             threshold: 相似度阈值
             include_url: 是否包含URL
-
+            
         Returns:
             聚合后的新闻列表
         """
         if not news_list:
             return []
 
-        # 预计算字符集合用于快速过滤
+        # 1. 预处理：生成 Token 集合并统计词频
         prepared_news = []
+        global_token_counts = Counter()
+        
         for news in news_list:
-            char_set = set(news["title"])
+            # 简单的分词：提取连续的中英文字符
+            tokens = set(re.findall(r'[\u4e00-\u9fa5a-zA-Z0-9]{2,}', news["title"]))
+            
+            # 更新词频
+            for t in tokens:
+                global_token_counts[t] += 1
+                
             prepared_news.append({
                 "data": news,
-                "char_set": char_set,
-                "set_len": len(char_set)
+                "tokens": tokens,
+                "weight": news.get("weight", 0)
             })
 
-        # 按权重排序
-        sorted_items = sorted(prepared_news, key=lambda x: x["data"].get("weight", 0), reverse=True)
+        # 动态停用词过滤：忽略出现频率过高的通用词
+        # 优化：从 20% 降低到 5%，更激进地过滤掉 "新闻", "中国" 等无区分度的词
+        total_docs = len(news_list)
+        high_freq_threshold = max(5, int(total_docs * 0.05))
+        
+        # 2. 排序：按权重降序
+        sorted_items = sorted(prepared_news, key=lambda x: x["weight"], reverse=True)
 
-        aggregated = []
-        used_indices = set()
-        PRE_FILTER_RATIO = 0.5  # 粗筛阈值系数
+        clusters = []  # 存储聚类结果
+        token_index = defaultdict(list)  # 倒排索引: token -> [cluster_idx_1, cluster_idx_2]
 
-        for i, item in enumerate(sorted_items):
-            if i in used_indices:
-                continue
-
+        for i_item, item in enumerate(sorted_items):
+            if i_item % 500 == 0:
+                print(f"[Analytics] Aggregating item {i_item}/{len(sorted_items)}...")
+            
+            current_tokens = item["tokens"]
+            
+            # 过滤掉高频词用于索引（但在比较时仍然使用全量Token）
+            indexing_tokens = [t for t in current_tokens if global_token_counts[t] < high_freq_threshold]
             news = item["data"]
-            base_set = item["char_set"]
-            base_len = item["set_len"]
-
-            group = {
+            
+            # 基础聚类结构
+            current_cluster_data = {
                 "representative_title": news["title"],
                 "platforms": [news["platform_name"]],
                 "platform_ids": [news["platform"]],
@@ -2209,84 +2230,153 @@ class AnalyticsTools:
                     "platform": news["platform_name"],
                     "rank": news["rank"],
                     "date": news["date"]
-                }]
+                }],
+                "rep_info_tokens": current_tokens, # 临时字段：用于比较
+                "rep_info_title": news["title"]    # 临时字段：用于比较
             }
-
+            
             if include_url and news.get("url"):
-                group["urls"] = [{
+                current_cluster_data["urls"] = [{
                     "platform": news["platform_name"],
                     "url": news.get("url", ""),
                     "mobileUrl": news.get("mobileUrl", "")
                 }]
 
-            used_indices.add(i)
+            if not indexing_tokens: # 如果所有词都是高频词，或者没有词
+                # 尝试退化使用所有词（如果非空），否则作为独立聚类
+                if current_tokens:
+                     fallback_tokens = list(current_tokens)
+                else:
+                    clusters.append(current_cluster_data)
+                    continue
+            else:
+                fallback_tokens = indexing_tokens
 
-            # 查找相似新闻
-            for j in range(i + 1, len(sorted_items)):
-                if j in used_indices:
+            # 优化：仅使用最稀有的前 10 个词进行投票
+            # 这一步极大减少了 Candidate Generation 的开销
+            if len(fallback_tokens) > 10:
+                # 按全局词频升序排序 (越稀有越靠前)
+                fallback_tokens.sort(key=lambda t: global_token_counts[t])
+                search_tokens = fallback_tokens[:10]
+            else:
+                search_tokens = fallback_tokens
+
+            # 3. 检索候选聚类 (Voting Mechanism)
+            # 使用过滤后的低频词进行投票，精准度更高，速度更快
+            candidate_votes = Counter()
+            for token in search_tokens:
+                # 直接获取 token 对应的聚类索引列表
+                cluster_indices = token_index[token]
+                # 即使词频 < 5%，在2700条里也可能有100+次，限制遍历上限
+                if len(cluster_indices) > 200: 
+                    continue
+                    
+                for c_idx in cluster_indices:
+                    candidate_votes[c_idx] += 1
+            
+            # 4. 寻找最佳匹配 (Limit Top-K)
+            # 仅检测重合度最高的 K 个候选者，极大减少 SequnchMatcher 调用次数
+            # 设置 K=50，足以覆盖绝大多数相似新闻，同时保证性能上限为 linear
+            top_candidates = candidate_votes.most_common(25)
+            
+            best_match_idx = -1
+            best_sim = -1.0
+
+            for idx, vote_count in top_candidates:
+                existing_cluster = clusters[idx]
+                
+                # 获取代表信息
+                if "rep_info_tokens" not in existing_cluster:
+                    continue
+                    
+                rep_tokens = existing_cluster["rep_info_tokens"]
+                rep_title = existing_cluster["rep_info_title"]
+                
+                # 快速剪枝：如果重合 token 数过少，且总 token 数较多，Jaccard 肯定很低
+                # vote_count 是 intersection 的上界 (因为我们只看 current_tokens)
+                # jaccard = intersection / union
+                # union >= len(current_tokens)
+                # 所以 jaccard <= vote_count / len(current_tokens)
+                # 如果这个上界都小于 threshold * 0.5，则没必要细算
+                max_possible_jaccard = vote_count / len(current_tokens)
+                if max_possible_jaccard < threshold * 0.5:
                     continue
 
-                compare_item = sorted_items[j]
-                compare_set = compare_item["char_set"]
-                compare_len = compare_item["set_len"]
-
-                # 快速粗筛：长度检查
-                if base_len == 0 or compare_len == 0:
+                # Jaccard 粗筛
+                intersection = len(current_tokens & rep_tokens)
+                if intersection == 0: continue
+                
+                union = len(current_tokens | rep_tokens)
+                jaccard = intersection / union
+                
+                if jaccard < threshold * 0.3: # 稍微放宽一点粗筛，依赖 Top-K 保证性能
                     continue
 
-                # 快速粗筛：长度比例检查
-                if min(base_len, compare_len) / max(base_len, compare_len) < (threshold * PRE_FILTER_RATIO):
-                    continue
+                # 精确计算
+                sim = self._calculate_similarity(news["title"], rep_title)
+                if sim >= threshold and sim > best_sim:
+                    best_sim = sim
+                    best_match_idx = idx
+                    
+                    # 激进优化：Early Exit (提前退出)
+                    # 如果找到极其相似的(>0.9)，认为就是同一事件，不再继续比较后续候选者
+                    # 这能极大减少不必要的比较
+                    if best_sim > 0.9:
+                        break
+            
+            # 5. 聚类决策
+            if best_match_idx != -1:
+                # 命中 -> 合并到现有聚类
+                target_cluster = clusters[best_match_idx]
+                
+                if news["platform_name"] not in target_cluster["platforms"]:
+                    target_cluster["platforms"].append(news["platform_name"])
+                    target_cluster["platform_ids"].append(news["platform"])
 
-                # 快速粗筛：Jaccard 相似度
-                intersection = len(base_set & compare_set)
-                union = len(base_set | compare_set)
-                jaccard_sim = intersection / union if union > 0 else 0
+                if news["date"] not in target_cluster["dates"]:
+                    target_cluster["dates"].append(news["date"])
 
-                if jaccard_sim < (threshold * PRE_FILTER_RATIO):
-                    continue
+                target_cluster["best_rank"] = min(target_cluster["best_rank"], news["rank"])
+                target_cluster["total_count"] += news["count"]
+                target_cluster["aggregate_weight"] += news.get("weight", 0) * 0.5
 
-                # 精确计算：SequenceMatcher
-                other_news = compare_item["data"]
-                real_similarity = self._calculate_similarity(news["title"], other_news["title"])
-
-                if real_similarity >= threshold:
-                    # 合并到当前组
-                    if other_news["platform_name"] not in group["platforms"]:
-                        group["platforms"].append(other_news["platform_name"])
-                        group["platform_ids"].append(other_news["platform"])
-
-                    if other_news["date"] not in group["dates"]:
-                        group["dates"].append(other_news["date"])
-
-                    group["best_rank"] = min(group["best_rank"], other_news["rank"])
-                    group["total_count"] += other_news["count"]
-                    group["aggregate_weight"] += other_news.get("weight", 0) * 0.5  # 额外权重
-
-                    group["sources"].append({
-                        "platform": other_news["platform_name"],
-                        "rank": other_news["rank"],
-                        "date": other_news["date"]
+                target_cluster["sources"].append({
+                    "platform": news["platform_name"],
+                    "rank": news["rank"],
+                    "date": news["date"]
+                })
+                
+                if include_url and news.get("url"):
+                    if "urls" not in target_cluster:
+                        target_cluster["urls"] = []
+                    target_cluster["urls"].append({
+                        "platform": news["platform_name"],
+                        "url": news.get("url", ""),
+                        "mobileUrl": news.get("mobileUrl", "")
                     })
+            else:
+                # 未命中 -> 新建聚类
+                new_idx = len(clusters)
+                clusters.append(current_cluster_data)
+                
+                # 更新索引 (仅使用有效词)
+                for token in fallback_tokens:
+                    token_index[token].append(new_idx)
 
-                    if include_url and other_news.get("url"):
-                        if "urls" not in group:
-                            group["urls"] = []
-                        group["urls"].append({
-                            "platform": other_news["platform_name"],
-                            "url": other_news.get("url", ""),
-                            "mobileUrl": other_news.get("mobileUrl", "")
-                        })
+        # 清理辅助字段并完善统计信息
+        final_clusters = []
+        for c in clusters:
+            # 删除临时字段
+            c.pop("rep_info_tokens", None)
+            c.pop("rep_info_title", None)
+            
+            # 计算统计字段
+            c["platform_count"] = len(c["platforms"])
+            c["is_cross_platform"] = len(c["platforms"]) > 1
+            
+            final_clusters.append(c)
 
-                    used_indices.add(j)
-
-            # 添加聚合信息
-            group["platform_count"] = len(group["platforms"])
-            group["is_cross_platform"] = len(group["platforms"]) > 1
-
-            aggregated.append(group)
-
-        return aggregated
+        return final_clusters
 
     # ==================== 时期对比分析工具 ====================
 
