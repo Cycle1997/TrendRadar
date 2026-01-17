@@ -49,7 +49,7 @@ class RobustFastMCP(FastMCP):
             ('sessionId', Optional[str], None),
             ('action', Optional[str], None),
             ('chatInput', Optional[str], None),
-            ('toolCalled', Optional[str], None)
+            ('toolCallId', Optional[str], None)
         ]
         
         # Add them to signature if missing
