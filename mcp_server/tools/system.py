@@ -114,7 +114,19 @@ class SystemManagementTools:
                 config_data = yaml.safe_load(f)
 
             # 获取平台配置
-            all_platforms = config_data.get("platforms", [])
+            raw_platforms = config_data.get("platforms", [])
+            
+            # 兼容处理：如果 platforms 是字典（新版配置），取其中的 sources
+            if isinstance(raw_platforms, dict):
+                raw_platforms = raw_platforms.get("sources", [])
+            
+            all_platforms = []
+            for p in raw_platforms:
+                if isinstance(p, str):
+                    all_platforms.append({"id": p, "name": p})
+                elif isinstance(p, dict):
+                    all_platforms.append(p)
+
             if not all_platforms:
                 raise CrawlTaskError(
                     "配置文件中没有平台配置",

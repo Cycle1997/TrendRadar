@@ -21,8 +21,74 @@ from .utils.date_parser import DateParser
 from .utils.errors import MCPError
 
 
-# 创建 FastMCP 2.0 应用
-mcp = FastMCP('trendradar-news')
+import inspect
+import functools
+
+class RobustFastMCP(FastMCP):
+    """
+    Enhanced FastMCP that automatically strips N8N context arguments
+    (sessionId, action, chatInput) from tool calls.
+    """
+    def tool(self, func=None, **kwargs):
+        # 1. Handle @mcp.tool usage (without args)
+        if func is not None:
+            return self._create_robust_wrapper(func, **kwargs)
+            
+        # 2. Handle @mcp.tool(name="foo") usage
+        def decorator(f):
+            return self._create_robust_wrapper(f, **kwargs)
+        return decorator
+
+    def _create_robust_wrapper(self, func, **kwargs):
+        # Inspect original signature
+        sig = inspect.signature(func)
+        params = list(sig.parameters.values())
+
+        # Define N8N optional args
+        extra_args = [
+            ('sessionId', Optional[str], None),
+            ('action', Optional[str], None),
+            ('chatInput', Optional[str], None)
+        ]
+        
+        # Add them to signature if missing
+        new_params = params.copy()
+        for name, annotation, default in extra_args:
+            if name not in sig.parameters:
+                new_params.append(
+                    inspect.Parameter(name, inspect.Parameter.KEYWORD_ONLY, annotation=annotation, default=default)
+                )
+
+        # Create new signature
+        new_sig = sig.replace(parameters=new_params)
+
+        # Create wrapper that swallows extra args
+        @functools.wraps(func)
+        async def wrapper(*args, **input_kwargs):
+            # Only pass args that original function accepts
+            filtered_kwargs = {
+                k: v for k, v in input_kwargs.items() 
+                if k in sig.parameters
+            }
+            return await func(*args, **filtered_kwargs)
+
+        # Update wrapper signature & annotations so FastMCP/Pydantic sees the new args
+        wrapper.__signature__ = new_sig
+        
+        # Ensure annotations are updated for Pydantic
+        if not hasattr(wrapper, '__annotations__'):
+            wrapper.__annotations__ = {}
+        # Copy existing annotations
+        wrapper.__annotations__.update(getattr(func, '__annotations__', {}))
+        # Add new arg annotations
+        for name, annotation, _ in extra_args:
+            wrapper.__annotations__[name] = annotation
+        
+        # Register with parent class
+        return super().tool(wrapper, **kwargs)
+
+# 创建 FastMCP 2.0 应用 (使用增强版类)
+mcp = RobustFastMCP('trendradar-news')
 
 # 全局工具实例（在第一次请求时初始化）
 _tools_instances = {}
