@@ -2279,8 +2279,8 @@ class AnalyticsTools:
                         "mobileUrl": news.get("mobileUrl", "")
                     }]
                 
-                group["platform_count"] = 1
-                group["is_cross_platform"] = False
+                new_group["platform_count"] = 1
+                new_group["is_cross_platform"] = False
 
                 aggregated.append(new_group)
 
