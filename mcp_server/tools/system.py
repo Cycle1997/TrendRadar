@@ -118,8 +118,13 @@ class SystemManagementTools:
             
             # 兼容处理：如果 platforms 是字典（新版配置），取其中的 sources
             if isinstance(raw_platforms, dict):
+                if not raw_platforms.get("enabled", True):
+                    raise CrawlTaskError(
+                        "热榜平台已禁用",
+                        suggestion="请检查 config/config.yaml 中的 platforms.enabled 配置"
+                    )
                 raw_platforms = raw_platforms.get("sources", [])
-            
+
             all_platforms = []
             for p in raw_platforms:
                 if isinstance(p, str):
@@ -130,7 +135,7 @@ class SystemManagementTools:
             if not all_platforms:
                 raise CrawlTaskError(
                     "配置文件中没有平台配置",
-                    suggestion="请检查 config/config.yaml 中的 platforms 配置"
+                    suggestion="请检查 config/config.yaml 中的 platforms.sources 配置"
                 )
 
             # 过滤平台

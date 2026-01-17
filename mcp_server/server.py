@@ -27,7 +27,7 @@ import functools
 class RobustFastMCP(FastMCP):
     """
     Enhanced FastMCP that automatically strips N8N context arguments
-    (sessionId, action, chatInput) from tool calls.
+    (sessionId, action, chatInput, toolCallId) from tool calls.
     """
     def tool(self, func=None, **kwargs):
         # 1. Handle @mcp.tool usage (without args)
