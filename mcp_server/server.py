@@ -48,7 +48,8 @@ class RobustFastMCP(FastMCP):
         extra_args = [
             ('sessionId', Optional[str], None),
             ('action', Optional[str], None),
-            ('chatInput', Optional[str], None)
+            ('chatInput', Optional[str], None),
+            ('toolCalled', Optional[str], None)
         ]
         
         # Add them to signature if missing
