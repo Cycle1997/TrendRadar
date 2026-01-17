@@ -10,6 +10,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Union
 from difflib import SequenceMatcher
+from functools import lru_cache
 
 import yaml
 
@@ -27,6 +28,7 @@ from ..utils.validators import (
 from ..utils.errors import MCPError, InvalidParameterError, DataNotFoundError
 
 
+@lru_cache(maxsize=1)
 def _get_weight_config() -> Dict:
     """
     从 config.yaml 读取权重配置
@@ -2197,9 +2199,9 @@ class AnalyticsTools:
             })
 
         # 动态停用词过滤：忽略出现频率过高的通用词
-        # 优化：从 20% 降低到 5%，更激进地过滤掉 "新闻", "中国" 等无区分度的词
+        # 优化：设置为 15% (平衡点)，既过滤掉极其泛滥的词，又保留有一定的区分度的中频词
         total_docs = len(news_list)
-        high_freq_threshold = max(5, int(total_docs * 0.05))
+        high_freq_threshold = max(5, int(total_docs * 0.15))
         
         # 2. 排序：按权重降序
         sorted_items = sorted(prepared_news, key=lambda x: x["weight"], reverse=True)
@@ -2252,12 +2254,12 @@ class AnalyticsTools:
             else:
                 fallback_tokens = indexing_tokens
 
-            # 优化：仅使用最稀有的前 10 个词进行投票
-            # 这一步极大减少了 Candidate Generation 的开销
-            if len(fallback_tokens) > 10:
+            # 优化：仅使用最稀有的前 30 个词进行投票
+            # 30个词足以覆盖绝大多数标题的所有有效词，避免因截断导致漏票
+            if len(fallback_tokens) > 30:
                 # 按全局词频升序排序 (越稀有越靠前)
                 fallback_tokens.sort(key=lambda t: global_token_counts[t])
-                search_tokens = fallback_tokens[:10]
+                search_tokens = fallback_tokens[:30]
             else:
                 search_tokens = fallback_tokens
 
@@ -2276,8 +2278,8 @@ class AnalyticsTools:
             
             # 4. 寻找最佳匹配 (Limit Top-K)
             # 仅检测重合度最高的 K 个候选者，极大减少 SequnchMatcher 调用次数
-            # 设置 K=50，足以覆盖绝大多数相似新闻，同时保证性能上限为 linear
-            top_candidates = candidate_votes.most_common(25)
+            # 设置 K=50，扩大搜索范围以确保召回率
+            top_candidates = candidate_votes.most_common(50)
             
             best_match_idx = -1
             best_sim = -1.0
@@ -2299,9 +2301,6 @@ class AnalyticsTools:
                 # 所以 jaccard <= vote_count / len(current_tokens)
                 # 如果这个上界都小于 threshold * 0.5，则没必要细算
                 max_possible_jaccard = vote_count / len(current_tokens)
-                if max_possible_jaccard < threshold * 0.5:
-                    continue
-
                 # Jaccard 粗筛
                 intersection = len(current_tokens & rep_tokens)
                 if intersection == 0: continue
@@ -2312,15 +2311,14 @@ class AnalyticsTools:
                 if jaccard < threshold * 0.3: # 稍微放宽一点粗筛，依赖 Top-K 保证性能
                     continue
 
-                # 精确计算
+                # 精确计算 (恢复 SequenceMatcher 以保证准确度)
+                # 由于 IO 瓶颈已解决，这里的计算开销是可以接受的
                 sim = self._calculate_similarity(news["title"], rep_title)
                 if sim >= threshold and sim > best_sim:
                     best_sim = sim
                     best_match_idx = idx
                     
-                    # 激进优化：Early Exit (提前退出)
-                    # 如果找到极其相似的(>0.9)，认为就是同一事件，不再继续比较后续候选者
-                    # 这能极大减少不必要的比较
+                    # Early Exit: 确信的重复
                     if best_sim > 0.9:
                         break
             
